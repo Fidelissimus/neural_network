@@ -145,12 +145,14 @@ def sigmoid(x, derivative=False):
         return sig * (1 - sig)
     return 1 / (1 + np.exp(-x))
 
+# this function for -1 to 1 output range
 def tanh(x, derivative=False):
     if derivative:
         return 1 - np.tanh(x) ** 2
     return np.tanh(x)
 
-# Map activation function names to the functions themselves, made it fo json so i can reload
+
+# Map activation function names to the functions themselves, made it for json so i can reload
 activation_functions = {
     'relu': relu,
     'sigmoid': sigmoid,
@@ -166,20 +168,20 @@ layers = [
     LayerDense(1, 6, relu),    # First hidden layer with ReLU
     LayerDense(6, 8, relu),   # Hidden layer with ReLU
     LayerDense(8, 6, relu),   # Hidden layer with ReLU
-    LayerDense(6, 1, tanh)   # Output layer with Sigmoid
+    LayerDense(6, 2, tanh)   # Output layer with Sigmoid
 ]
 neural_net = NeuralNetwork(layers)
 
-# Generate dataset with 4 features and targets based on a function
+# Generate dataset with cartion features and targets based on a function
 num_samples = 20000
-inputs = np.random.rand(num_samples, 1) * 2 * np.pi  # 4 random inputs in the range [0, 2*pi]
-targets = np.sin(inputs.sum(axis=1))[:, None]  # Target is the sine of the sum of the inputs
-
+inputs = np.random.rand(num_samples, 1) * 2 * np.pi  # random inputs in the range [0, 2*pi]
+#targets = np.sin(inputs.sum(axis=1))[:, None]  # Target is the sine of the sum of the inputs
+targets = np.hstack([np.sin(inputs), np.cos(inputs)]) # target is sine and cosine of the input
 
 # Train the neural network
 learning_rate = 0.001  # Increased learning rate
 epochs = 500
-batch_size = 32  # Added batch size
+batch_size = 32  # Added batch size, this shit so we train slowly batch by batch (not sure if that even needed but this is how i made it finally learn and work)
 losses = []
 
 for epoch in range(epochs):
@@ -218,7 +220,8 @@ plt.show()
 
 # Test the neural network on some sample inputs
 test_inputs = np.random.rand(10, 1) * 2 * np.pi
-expected_outputs = np.sin(test_inputs.sum(axis=1))[:, None]
+#expected_outputs = np.sin(test_inputs.sum(axis=1))[:, None]
+expected_outputs = np.hstack([np.sin(test_inputs), np.cos(test_inputs)])
 predicted_outputs = neural_net.forward(test_inputs)
 
 print("\nExpected Outputs:")
