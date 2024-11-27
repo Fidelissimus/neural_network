@@ -1,8 +1,7 @@
 import json
 import numpy as np
-import matplotlib.pyplot as plt
 
-np.random.seed(0)
+#np.random.seed(0)
 
 class LayerDense:
     def __init__(self, input_size, output_size, activation_function):

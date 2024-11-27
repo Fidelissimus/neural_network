@@ -1,4 +1,5 @@
 from neural_network import *
+import matplotlib.pyplot as plt
 
 ####
 
@@ -11,15 +12,15 @@ layers = [
 ]
 neural_net = NeuralNetwork(layers)
 
-# Generate dataset with cartion features and targets based on a function
+# Generate dataset with certion features and targets based on a function
 num_samples = 20000
 inputs = np.random.rand(num_samples, 1) * 2 * np.pi  # random inputs in the range [0, 2*pi]
 #targets = np.sin(inputs.sum(axis=1))[:, None]  # Target is the sine of the sum of the inputs
 targets = np.hstack([np.sin(inputs), np.cos(inputs)]) # target is sine and cosine of the input
 
 # Train the neural network
-learning_rate = 0.001  # Increased learning rate
-epochs = 500
+learning_rate = 0.001  # learning rate
+epochs = 400
 batch_size = 32  # Added batch size, this shit so we train slowly batch by batch (not sure if that even needed but this is how i made it finally learn and work)
 losses = []
 

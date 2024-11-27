@@ -1,4 +1,5 @@
 from neural_network import *
+import matplotlib.pyplot as plt
 
 # Load the trained neural network from a JSON file
 loaded_neural_net = NeuralNetwork.load('sine_nn_example.json', activation_functions)
