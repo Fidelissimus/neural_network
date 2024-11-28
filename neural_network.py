@@ -21,7 +21,7 @@ class LayerDense:
         return self.output
 
     def backward(self, delta):
-            d_activation = self.activation_function(self.output, derivative=True)
+        d_activation = self.activation_function(self.output, derivative=True)
         
         self.delta = delta * d_activation
         return np.dot(self.delta, self.weights.T)
