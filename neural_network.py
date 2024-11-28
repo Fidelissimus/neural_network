@@ -21,9 +21,6 @@ class LayerDense:
         return self.output
 
     def backward(self, delta):
-        if self.activation_function.__name__ == 'relu':
-            d_activation = self.activation_function(self.output, derivative=True)
-        else:
             d_activation = self.activation_function(self.output, derivative=True)
         
         self.delta = delta * d_activation

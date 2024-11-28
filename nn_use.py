@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 ####
 
-# Create a neural network with one input layer, 20 hidden layers, and one output layer
+# Create a neural network with one input layer, 2 hidden layers, and two output layer
 layers = [
     LayerDense(1, 6, relu),    # First hidden layer with ReLU
     LayerDense(6, 8, relu),   # Hidden layer with ReLU
