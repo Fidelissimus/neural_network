@@ -1,197 +1,211 @@
 import numpy as np
 import json
 import matplotlib.pyplot as plt
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Optional
 
-def train_test_split(X: np.ndarray, y: np.ndarray, test_size: float = 0.2, 
-                    random_state: int = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+# ---------------------------------------------------------------------------
+# Data splitting
+# ---------------------------------------------------------------------------
+
+def train_test_split(X: np.ndarray, y: np.ndarray,
+                     test_size: float = 0.2,
+                     random_state: Optional[int] = None
+                     ) -> Tuple[np.ndarray, np.ndarray,
+                                np.ndarray, np.ndarray]:
     """
-    Split dataset into training and testing sets
-    
+    Split arrays into random train and test subsets.
+
     Args:
-        X: Input features
-        y: Target values
-        test_size: Proportion of dataset to include in test split
-        random_state: Seed for random number generator
-        
+        X:            Feature matrix, shape (N, ...).
+        y:            Target array, shape (N, ...).
+        test_size:    Proportion of the dataset to use as test set. Default 0.2.
+        random_state: Seed for reproducibility. Default None.
+
     Returns:
-        X_train, X_test, y_train, y_test
+        x_train, x_test, y_train, y_test
     """
+    if not 0.0 < test_size < 1.0:
+        raise ValueError(f"test_size must be in (0, 1), got {test_size}.")
+
     if random_state is not None:
         np.random.seed(random_state)
-        
+
     n_samples = X.shape[0]
-    n_test = int(n_samples * test_size)
-    
-    # Shuffle indices
-    indices = np.random.permutation(n_samples)
-    
-    test_indices = indices[:n_test]
+    n_test    = max(1, int(n_samples * test_size))
+
+    indices       = np.random.permutation(n_samples)
+    test_indices  = indices[:n_test]
     train_indices = indices[n_test:]
-    
+
     return X[train_indices], X[test_indices], y[train_indices], y[test_indices]
 
-# Made for GNN, but I didn't write GNN type layer class yet, so this function is an orphan
-def train_test_split_indices(n_samples, test_size=0.2, random_state=None):
+
+def train_test_split_indices(n_samples: int, test_size: float = 0.2,
+                             random_state: Optional[int] = None
+                             ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Split indices into training and testing sets
-    
+    Generate train and test index arrays for a dataset of `n_samples` samples.
+
+    Useful for graph-structured data (e.g. GNNs) where you cannot simply
+    slice the array along the first axis.
+
     Args:
-        n_samples: Total number of samples
-        test_size: Proportion of dataset to include in test split
-        random_state: Seed for random number generator
-        
+        n_samples:    Total number of samples.
+        test_size:    Fraction to use as test. Default 0.2.
+        random_state: Seed for reproducibility.
+
     Returns:
-        train_indices, test_indices
+        train_indices, test_indices (both as 1-D integer arrays)
     """
     if random_state is not None:
         np.random.seed(random_state)
-        
-    indices = np.random.permutation(n_samples)
-    split_idx = int(n_samples * (1 - test_size))
-    
+
+    indices   = np.random.permutation(n_samples)
+    split_idx = int(n_samples * (1.0 - test_size))
     return indices[:split_idx], indices[split_idx:]
 
 
-def one_hot_encode(y: np.ndarray, num_classes: int = None) -> np.ndarray:
-    """
-    Convert class labels to one-hot encoded vectors
-    
-    Args:
-        y: Class labels (1D array)
-        num_classes: Number of classes (if None, inferred from y)
-        
-    Returns:
-        One-hot encoded matrix
-    """
-    if num_classes is None:
-        num_classes = len(np.unique(y))
-        
-    if y.ndim == 1:
-        y = y.reshape(-1, 1)
-        
-    return np.eye(num_classes)[y.astype(int)].reshape(y.shape[0], num_classes)
+# ---------------------------------------------------------------------------
+# Encoding and preprocessing
+# ---------------------------------------------------------------------------
 
-def normalize(X: np.ndarray, axis: int = 0) -> np.ndarray:
+def one_hot_encode(y: np.ndarray,
+                   num_classes: Optional[int] = None) -> np.ndarray:
     """
-    Normalize data to have zero mean and unit variance
-    
+    Convert integer class labels to a one-hot encoded matrix.
+
     Args:
-        X: Input data
-        axis: Axis along which to compute mean and std
-        
+        y:           1-D array of integer class labels.
+        num_classes: Number of classes. If None, inferred as max(y) + 1.
+
     Returns:
-        Normalized data
+        One-hot matrix of shape (N, num_classes).
+    """
+    y = np.asarray(y, dtype=int).flatten()
+    if num_classes is None:
+        num_classes = int(y.max()) + 1
+    return np.eye(num_classes, dtype=float)[y]
+
+
+def normalize(X: np.ndarray, axis: int = 0,
+              eps: float = 1e-8) -> np.ndarray:
+    """
+    Standardise data to zero mean and unit variance (Z-score normalisation).
+
+    Args:
+        X:    Input data array.
+        axis: Axis along which mean and std are computed. Default 0 (per feature).
+        eps:  Small constant added to std to avoid division by zero.
+
+    Returns:
+        Normalised array with the same shape as X.
     """
     mean = np.mean(X, axis=axis, keepdims=True)
-    std = np.std(X, axis=axis, keepdims=True)
-    return (X - mean) / (std + 1e-8)
+    std  = np.std(X,  axis=axis, keepdims=True)
+    return (X - mean) / (std + eps)
 
-def minmax_scale(X: np.ndarray, feature_range: Tuple[float, float] = (0, 1)) -> np.ndarray:
+
+def minmax_scale(X: np.ndarray,
+                 feature_range: Tuple[float, float] = (0.0, 1.0),
+                 eps: float = 1e-8) -> np.ndarray:
     """
-    Scale features to a given range
-    
+    Scale features to a specified range using min-max normalisation.
+
     Args:
-        X: Input data
-        feature_range: Desired range of transformed data
-        
+        X:             Input data array.
+        feature_range: (min, max) of the output range. Default (0, 1).
+        eps:           Small constant to avoid division by zero.
+
     Returns:
-        Scaled data
+        Scaled array with values in `feature_range`.
     """
-    min_val, max_val = feature_range
-    X_min = np.min(X, axis=0, keepdims=True)
-    X_max = np.max(X, axis=0, keepdims=True)
-    
-    X_std = (X - X_min) / (X_max - X_min + 1e-8)
-    return X_std * (max_val - min_val) + min_val
+    lo, hi = feature_range
+    x_min = np.min(X, axis=0, keepdims=True)
+    x_max = np.max(X, axis=0, keepdims=True)
+    x_std = (X - x_min) / (x_max - x_min + eps)
+    return x_std * (hi - lo) + lo
 
-def plot_training_history(history: Dict[str, List[float]], 
-                         metrics: List[str] = ['loss', 'acc'],
-                         figsize: Tuple[int, int] = (12, 4)) -> None:
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_training_history(history: Dict[str, List[float]],
+                          metrics: List[str] = ('loss', 'acc'),
+                          figsize: Tuple[int, int] = (12, 4),
+                          save_path: Optional[str] = None) -> None:
     """
-    Plot training history
-    
+    Plot training (and optionally validation) curves for the requested metrics.
+
     Args:
-        history: Dictionary containing training history
-        metrics: List of metrics to plot
-        figsize: Figure size
+        history:   Dict returned by NeuralNetwork.train(), containing keys
+                   like 'train_loss', 'val_loss', 'train_acc', 'val_acc'.
+        metrics:   Which metrics to plot. Each metric produces one subplot.
+                   Default ('loss', 'acc').
+        figsize:   Overall figure size as (width, height) in inches.
+        save_path: If provided, saves the figure to this path instead of
+                   showing it interactively.
     """
-    n_metrics = len(metrics)
-    fig, axes = plt.subplots(1, n_metrics, figsize=figsize)
-    
-    if n_metrics == 1:
+    n = len(metrics)
+    fig, axes = plt.subplots(1, n, figsize=figsize)
+    if n == 1:
         axes = [axes]
-    
-    for i, metric in enumerate(metrics):
-        if f'train_{metric}' in history:
-            axes[i].plot(history[f'train_{metric}'], label=f'Train {metric}')
-        if f'val_{metric}' in history:
-            axes[i].plot(history[f'val_{metric}'], label=f'Validation {metric}')
-        
-        axes[i].set_title(f'{metric.capitalize()} over Epochs')
-        axes[i].set_xlabel('Epoch')
-        axes[i].set_ylabel(metric.capitalize())
-        axes[i].legend()
-        axes[i].grid(True, alpha=0.3)
-    
+
+    for ax, metric in zip(axes, metrics):
+        train_key = f'train_{metric}'
+        val_key   = f'val_{metric}'
+
+        if train_key in history and history[train_key]:
+            ax.plot(history[train_key], label=f'Train {metric}', linewidth=1.5)
+        if val_key in history and history[val_key]:
+            ax.plot(history[val_key],   label=f'Val {metric}',   linewidth=1.5,
+                    linestyle='--')
+
+        ax.set_title(f'{metric.capitalize()} over epochs')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(metric.capitalize())
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    plt.show()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+# ---------------------------------------------------------------------------
+# History I/O
+# ---------------------------------------------------------------------------
 
 def save_history(history: Dict[str, List[float]], file_path: str) -> None:
     """
-    Save training history to a JSON file
-    
+    Serialise a training history dict to a JSON file.
+
+    All values are converted to plain Python floats so json.dump works
+    regardless of whether the history contains numpy scalars.
+
     Args:
-        history: Training history
-        file_path: Path to save file
+        history:   Dict with string keys and lists of numeric values.
+        file_path: Destination path.
     """
-    # Convert numpy arrays to lists for JSON serialization
-    serializable_history = {k: [float(x) for x in v] for k, v in history.items()}
-    
+    serialisable = {k: [float(x) for x in v] for k, v in history.items()}
     with open(file_path, 'w') as f:
-        json.dump(serializable_history, f, indent=4)
+        json.dump(serialisable, f, indent=4)
+
 
 def load_history(file_path: str) -> Dict[str, List[float]]:
     """
-    Load training history from a JSON file
-    
+    Load a training history dict that was previously saved with save_history.
+
     Args:
-        file_path: Path to history file
-        
+        file_path: Path to the JSON file.
+
     Returns:
-        Training history
+        Dict with string keys and lists of floats.
     """
     with open(file_path, 'r') as f:
         return json.load(f)
-
-def learning_rate_scheduler(initial_lr: float, decay_type: str = 'exponential', 
-                           decay_rate: float = 0.1, decay_steps: int = 1000) -> callable:
-    """
-    Create a learning rate scheduler function
-    
-    Args:
-        initial_lr: Initial learning rate
-        decay_type: Type of decay ('exponential', 'step', 'time_based')
-        decay_rate: Rate of decay
-        decay_steps: Number of steps between decays (for step decay)
-        
-    Returns:
-        Function that takes epoch number and returns learning rate
-    """
-    if decay_type == 'exponential':
-        def scheduler(epoch):
-            return initial_lr * np.exp(-decay_rate * epoch)
-    
-    elif decay_type == 'step':
-        def scheduler(epoch):
-            return initial_lr * decay_rate ** (epoch // decay_steps)
-    
-    elif decay_type == 'time_based':
-        def scheduler(epoch):
-            return initial_lr / (1 + decay_rate * epoch)
-    
-    else:
-        def scheduler(epoch):
-            return initial_lr
-    
-    return scheduler
