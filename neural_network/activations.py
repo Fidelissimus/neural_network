@@ -187,13 +187,21 @@ class Softmax(Activation):
     the full Jacobian is folded into CategoricalCrossEntropy.backward,
     which simplifies the combined gradient to (y_pred - y_true) / N.
     Using Softmax with any other loss requires computing the full Jacobian.
+
+    Normalizes over the *last* axis rather than a hardcoded axis=1, so this
+    works correctly both for plain (N, num_classes) classification output
+    and for per-timestep sequence output of shape (N, T, num_classes) (e.g.
+    a language-modeling head applied after MultiHeadAttention/recurrent
+    layers) -- axis=1 would silently normalize over the *time* axis instead
+    of the class axis in the latter case, which is wrong regardless of how
+    it's used downstream.
     """
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         self.input = x
-        shifted = x - np.max(x, axis=1, keepdims=True)
+        shifted = x - np.max(x, axis=-1, keepdims=True)
         exp_x = np.exp(shifted)
-        self.output = exp_x / np.sum(exp_x, axis=1, keepdims=True)
+        self.output = exp_x / np.sum(exp_x, axis=-1, keepdims=True)
         return self.output
 
     def backward(self, doutput: np.ndarray) -> np.ndarray:

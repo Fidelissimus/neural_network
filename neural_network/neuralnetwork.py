@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from .layers import (Layer, Dense, Dropout, BatchNorm, Conv2D, Flatten,
                      LayerNorm, MaxPool2D, AvgPool2D,
-                     Embedding, SimpleRNN, GRU, LSTM, MultiHeadAttention)
+                     Embedding, PositionalEncoding, SimpleRNN, GRU, LSTM, MultiHeadAttention)
 from .activations import ACTIVATIONS
 from .optimizers import OPTIMIZERS
 from .losses import LOSSES
@@ -23,6 +23,7 @@ _LAYER_CLASSES = {
     'MaxPool2D':          MaxPool2D,
     'AvgPool2D':          AvgPool2D,
     'Embedding':          Embedding,
+    'PositionalEncoding': PositionalEncoding,
     'SimpleRNN':          SimpleRNN,
     'GRU':                GRU,
     'LSTM':               LSTM,
@@ -76,6 +77,8 @@ class NeuralNetwork:
         }
         self.optimizer = None
         self.loss_fn   = None
+        self._gradient_clip: Optional[float] = None
+        self._weight_decay: float = 0.0
 
     # ------------------------------------------------------------------
     # Building the model
@@ -94,6 +97,7 @@ class NeuralNetwork:
     def compile(self, loss: str = 'mse', optimizer: str = 'adam',
                 learning_rate: float = 0.001,
                 gradient_clip: Optional[float] = None,
+                weight_decay: float = 0.0,
                 **optimizer_kwargs) -> None:
         """
         Configure the model for training.
@@ -109,6 +113,13 @@ class NeuralNetwork:
                             ball of this radius before the optimizer update.
                             Useful for preventing gradient explosions in deep
                             or recurrent networks. Default None (no clipping).
+            weight_decay:   L2 regularization strength. If > 0, `weight_decay
+                            * W` is added to the weight gradient of every
+                            regularizable layer before the optimizer step
+                            (i.e. classic L2 regularization, not decoupled
+                            AdamW-style decay). Biases and normalization
+                            scale parameters (BatchNorm/LayerNorm gamma) are
+                            never decayed. Default 0.0 (disabled).
             **optimizer_kwargs: Extra keyword arguments forwarded to the
                             optimizer constructor (e.g. momentum for SGD,
                             beta1/beta2 for Adam).
@@ -130,6 +141,20 @@ class NeuralNetwork:
                                              **optimizer_kwargs)
 
         self._gradient_clip = gradient_clip
+        self._weight_decay  = weight_decay
+
+    def _apply_weight_decay(self) -> None:
+        """
+        Add `weight_decay * W` to every regularizable layer's weight
+        gradient in-place, before clipping/the optimizer step. No-op when
+        weight_decay is 0 (the default).
+        """
+        if not self._weight_decay:
+            return
+        for layer in self.layers:
+            if (layer.trainable and getattr(layer, 'regularizable', True)
+                    and layer.dweights is not None):
+                layer.dweights = layer.dweights + self._weight_decay * layer.weights
 
     # ------------------------------------------------------------------
     # Forward / backward / update
@@ -207,6 +232,14 @@ class NeuralNetwork:
     # Accuracy helper
     # ------------------------------------------------------------------
 
+    def _is_regression(self, y: np.ndarray) -> bool:
+        """
+        True if the compiled loss and target shape indicate a regression
+        task (single output column, regression loss function).
+        """
+        return (y.shape[1] == 1
+                and self.loss_fn.__class__.__name__ in ('MSE', 'MAE', 'Huber'))
+
     @staticmethod
     def _batch_correct(output: np.ndarray, y_batch: np.ndarray) -> int:
         """
@@ -260,9 +293,7 @@ class NeuralNetwork:
 
         n_samples = x_train.shape[0]
         callbacks  = callbacks or []
-        is_regression = (y_train.shape[1] == 1
-                         and self.loss_fn.__class__.__name__
-                         in ('MSE', 'MAE', 'Huber'))
+        is_regression = self._is_regression(y_train)
 
         for cb in callbacks:
             cb.on_train_begin(self)
@@ -291,6 +322,8 @@ class NeuralNetwork:
                 # Backward pass and optimizer update
                 error = self.loss_fn.backward(output, y_batch)
                 self.backward(error)
+
+                self._apply_weight_decay()
 
                 if self._gradient_clip is not None:
                     self._clip_gradients()
@@ -361,7 +394,11 @@ class NeuralNetwork:
         output = self.forward(x, training=False)
         loss   = self.loss_fn.forward(output, y)
 
-        if y.shape[1] == 1:
+        if self._is_regression(y):
+            # A single-column regression target should never be scored as a
+            # 0.5-threshold binary accuracy; report 0.0 like train() does.
+            acc = 0.0
+        elif y.shape[1] == 1:
             predictions = (output > 0.5).astype(int)
             acc = float(np.mean(predictions == y))
         elif y.shape[1] > 1:
@@ -511,6 +548,10 @@ class NeuralNetwork:
                 layer = Embedding(params['vocab_size'], params['embed_dim'])
                 layer.set_parameters(params)
 
+            elif layer_type == 'PositionalEncoding':
+                layer = PositionalEncoding(params['d_model'],
+                                           max_len=params.get('max_len', 5000))
+
             elif layer_type == 'SimpleRNN':
                 layer = SimpleRNN(params['input_size'], params['hidden_size'],
                                   activation=params.get('activation', 'tanh'),
@@ -529,7 +570,8 @@ class NeuralNetwork:
 
             elif layer_type == 'MultiHeadAttention':
                 layer = MultiHeadAttention(params['d_model'], params['num_heads'],
-                                           dropout=params.get('dropout', 0.0))
+                                           dropout=params.get('dropout', 0.0),
+                                           causal=params.get('causal', False))
                 layer.set_parameters(params)
 
             else:

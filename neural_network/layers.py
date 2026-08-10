@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from typing import Optional, Tuple
 from .activations import ACTIVATIONS, Activation
 
@@ -16,7 +17,16 @@ class Layer:
     NOT update its own parameters inside backward.  This separation of
     concerns makes it possible to swap optimizers freely without touching
     any layer code.
+    NOTE ON WEIGHT DECAY: `regularizable` controls whether L2 weight decay
+    (set via `NeuralNetwork.compile(weight_decay=...)`) is applied to this
+    layer's weight matrix. Standard weight matrices (Dense, Conv2D,
+    Embedding, recurrent/attention projections) default to True. Layers
+    whose "weights" are actually normalization scale parameters (BatchNorm's
+    gamma, LayerNorm's gamma) override this to False, since decaying a norm
+    layer's scale toward zero is not standard practice and tends to hurt
+    training rather than help it.
     """
+    regularizable: bool = True
 
     def __init__(self):
         self.input: Optional[np.ndarray] = None
@@ -117,11 +127,23 @@ class Dense(Layer):
         # Backprop through the activation: dL/dz
         dz = self.activation.backward(doutput)
 
-        # Gradients w.r.t. parameters (stored for the optimizer)
-        self.dweights = self.input.T @ dz
-        self.dbiases  = np.sum(dz, axis=0, keepdims=True)
+        # Gradients w.r.t. parameters (stored for the optimizer).
+        # Flatten every leading dim (batch, time, ...) into one axis before
+        # the weight-gradient matmul. This matters whenever Dense is applied
+        # per-timestep to sequence input, e.g. stacked after MultiHeadAttention
+        # or a recurrent layer with return_sequences=True, giving input of
+        # shape (N, T, input_size) rather than (N, input_size). `self.input.T`
+        # only reverses axes correctly for a 2-D array; for anything higher
+        # rank it silently produces a shape mismatch, so this always goes
+        # through an explicit (-1, input_size) reshape instead.
+        x_flat  = self.input.reshape(-1, self.input_size)
+        dz_flat = dz.reshape(-1, self.output_size)
+        self.dweights = x_flat.T @ dz_flat
+        self.dbiases  = np.sum(dz_flat, axis=0, keepdims=True)
 
-        # Gradient w.r.t. input (passed to the layer below)
+        # Gradient w.r.t. input (passed to the layer below). This already
+        # broadcasts correctly for any leading-dim shape since it only
+        # contracts over the last axis.
         return dz @ self.weights.T
 
     def get_parameters(self) -> dict:
@@ -209,9 +231,16 @@ class BatchNorm(Layer):
     then applies learned scale (gamma) and shift (beta) parameters.
     Running statistics are maintained for use at inference time.
 
+    Supports both plain (N, num_features) input (after a Dense layer) and
+    channels-last spatial input of any rank, e.g. (N, H, W, num_features)
+    after a Conv2D layer -- statistics are computed over every axis except
+    the last (channel) axis, which is standard "spatial batchnorm" behavior:
+    for a (N, H, W, C) conv feature map that means averaging over N, H and W
+    jointly per channel, not just over N.
+
     During training:
-        mu  = mean(x, axis=0)
-        var = var(x,  axis=0)
+        mu  = mean(x, axis=all-but-last)
+        var = var(x,  axis=all-but-last)
         x_hat = (x - mu) / sqrt(var + eps)
         out = gamma * x_hat + beta
 
@@ -222,10 +251,12 @@ class BatchNorm(Layer):
     interface; both are exposed as properties that alias gamma and beta.
 
     Args:
-        num_features: Number of input features (= output size of the previous layer).
+        num_features: Number of channels / features (the *last* axis of the
+                      input, regardless of how many axes precede it).
         momentum:     EMA coefficient for running stats. Default 0.9.
         eps:          Small constant for numerical stability. Default 1e-5.
     """
+    regularizable = False  # gamma is a scale param, not a weight matrix -- don't L2-decay it
 
     def __init__(self, num_features: int, momentum: float = 0.9,
                  eps: float = 1e-5):
@@ -235,6 +266,12 @@ class BatchNorm(Layer):
         self.eps = eps
         self.trainable = True
 
+        # gamma/beta/running stats always stay 2-D (1, num_features); this
+        # is what the optimizer's moment buffers are shaped against, and it
+        # broadcasts correctly against input of *any* rank ending in
+        # num_features channels (NumPy broadcasting aligns trailing axes and
+        # treats missing leading axes as size 1), so no reshaping is needed
+        # to use them directly against higher-rank input.
         self.gamma = np.ones((1, num_features))
         self.beta  = np.zeros((1, num_features))
 
@@ -273,13 +310,22 @@ class BatchNorm(Layer):
 
     def forward(self, x: np.ndarray, training: bool = True) -> np.ndarray:
         self.input = x
+        # All axes except the last (channel) axis -- (0,) for (N, C) input,
+        # (0, 1, 2) for (N, H, W, C) conv feature maps, etc.
+        axes = tuple(range(x.ndim - 1))
 
         if training:
-            mean = np.mean(x, axis=0, keepdims=True)
-            var  = np.var(x,  axis=0, keepdims=True)
+            mean = np.mean(x, axis=axes, keepdims=True)
+            var  = np.var(x,  axis=axes, keepdims=True)
 
-            self.running_mean = self.momentum * self.running_mean + (1.0 - self.momentum) * mean
-            self.running_var  = self.momentum * self.running_var  + (1.0 - self.momentum) * var
+            # mean/var have shape (1, ..., 1, C) matching x's rank; squeeze
+            # down to the flat (1, C) shape that gamma/beta/running stats
+            # are always stored in (every axis but the last has size 1 here,
+            # so this reshape is exact, not a lossy summary).
+            mean_flat = mean.reshape(1, -1)
+            var_flat  = var.reshape(1, -1)
+            self.running_mean = self.momentum * self.running_mean + (1.0 - self.momentum) * mean_flat
+            self.running_var  = self.momentum * self.running_var  + (1.0 - self.momentum) * var_flat
 
             self._x_centered = x - mean
             self._var        = var
@@ -294,11 +340,16 @@ class BatchNorm(Layer):
         return self.output
 
     def backward(self, doutput: np.ndarray) -> np.ndarray:
-        m = self.input.shape[0]
+        axes = tuple(range(doutput.ndim - 1))
+        # Total number of elements normalized per channel: just the batch
+        # size N for (N, C) input, or N*H*W for (N, H, W, C) conv input.
+        m = int(np.prod(self.input.shape[:-1]))
 
-        # Gradients for gamma and beta
-        dgamma = np.sum(doutput * self._x_hat,    axis=0, keepdims=True)
-        dbeta  = np.sum(doutput,                  axis=0, keepdims=True)
+        # Gradients for gamma and beta -- reshape down to (1, num_features)
+        # to match how gamma/beta/the optimizer's moment buffers are stored,
+        # same reasoning as mean_flat/var_flat in forward().
+        dgamma = np.sum(doutput * self._x_hat, axis=axes, keepdims=True).reshape(1, -1)
+        dbeta  = np.sum(doutput,               axis=axes, keepdims=True).reshape(1, -1)
 
         # Stored so the optimizer can update gamma and beta
         self.dweights = dgamma
@@ -310,12 +361,12 @@ class BatchNorm(Layer):
         # Gradient w.r.t. variance
         dvar = np.sum(
             dx_hat * self._x_centered * (-0.5) * (self._var + self.eps) ** (-1.5),
-            axis=0, keepdims=True
+            axis=axes, keepdims=True
         )
 
         # Gradient w.r.t. mean
-        dmean = (np.sum(dx_hat * (-1.0 / self._std), axis=0, keepdims=True)
-                 + dvar * np.mean(-2.0 * self._x_centered, axis=0, keepdims=True))
+        dmean = (np.sum(dx_hat * (-1.0 / self._std), axis=axes, keepdims=True)
+                 + dvar * np.mean(-2.0 * self._x_centered, axis=axes, keepdims=True))
 
         # Gradient w.r.t. input
         dinput = (dx_hat / self._std
@@ -455,6 +506,13 @@ class Conv2D(Layer):
         """
         Convert a padded image tensor into a column matrix.
 
+        Vectorized with `sliding_window_view` instead of a Python-level loop
+        over every output position -- for a realistic input (say 128x128,
+        stride 1, 3x3 kernel) the old version ran ~16,000 Python loop
+        iterations per forward pass; this version does the equivalent work
+        as a handful of strided/broadcast NumPy ops with no extra memory
+        copies until the final reshape.
+
         Args:
             x:      (N, H, W, C)
             kH, kW: kernel height and width
@@ -467,23 +525,30 @@ class Conv2D(Layer):
         out_H = (H - kH) // stride + 1
         out_W = (W - kW) // stride + 1
 
-        col = np.zeros((N, out_H, out_W, kH * kW * C))
-
-        for i in range(out_H):
-            for j in range(out_W):
-                row_start = i * stride
-                col_start = j * stride
-                patch = x[:, row_start:row_start + kH,
-                           col_start:col_start + kW, :]   # (N, kH, kW, C)
-                col[:, i, j, :] = patch.reshape(N, -1)
-
+        # (N, H-kH+1, W-kW+1, C, kH, kW) -- a *view*, no copy yet
+        windows = sliding_window_view(x, (kH, kW), axis=(1, 2))
+        # subsample to the actual stride
+        windows = windows[:, ::stride, ::stride, :, :, :]
+        # reorder so the flattened axis order (kH, kW, C) matches the
+        # weight layout used elsewhere (kernel_size, kernel_size, C_in, C_out)
+        windows = windows.transpose(0, 1, 2, 4, 5, 3)  # (N, out_H, out_W, kH, kW, C)
+        col = windows.reshape(N, out_H, out_W, kH * kW * C)
         return col
 
     @staticmethod
     def _col2im(col: np.ndarray, x_shape: tuple, kH: int, kW: int,
                 stride: int) -> np.ndarray:
         """
-        Inverse of _im2col: scatter column values back into an image tensor.
+        Inverse of _im2col: scatter column values back into an image tensor,
+        accumulating overlapping contributions (necessary whenever
+        stride < kernel_size).
+
+        Vectorized with `np.add.at` and broadcast index grids instead of a
+        Python-level loop over every output position, for the same reason
+        as `_im2col` above. `np.add.at` is required (rather than plain
+        fancy-index assignment) because overlapping windows write to the
+        same input pixel more than once, and a plain `x[idx] = ...` would
+        silently keep only the last write instead of summing contributions.
 
         Args:
             col:     (N, out_H, out_W, kH * kW * C)
@@ -498,16 +563,21 @@ class Conv2D(Layer):
         out_H = (H - kH) // stride + 1
         out_W = (W - kW) // stride + 1
 
-        x = np.zeros(x_shape)
+        x = np.zeros(x_shape, dtype=col.dtype)
 
-        for i in range(out_H):
-            for j in range(out_W):
-                row_start = i * stride
-                col_start = j * stride
-                patch = col[:, i, j, :].reshape(N, kH, kW, C)
-                x[:, row_start:row_start + kH,
-                   col_start:col_start + kW, :] += patch
+        # (out_H, kH) row index of every kernel tap, and likewise for columns
+        row_idx = (np.arange(out_H)[:, None] * stride
+                   + np.arange(kH)[None, :])            # (out_H, kH)
+        col_idx = (np.arange(out_W)[:, None] * stride
+                   + np.arange(kW)[None, :])            # (out_W, kW)
 
+        # Broadcast to a shared (out_H, out_W, kH, kW) index grid
+        R = row_idx[:, None, :, None]                    # (out_H, 1, kH, 1)
+        Cx = col_idx[None, :, None, :]                    # (1, out_W, 1, kW)
+        R, Cx = np.broadcast_arrays(R, Cx)                # both (out_H, out_W, kH, kW)
+
+        patches = col.reshape(N, out_H, out_W, kH, kW, C)
+        np.add.at(x, (slice(None), R, Cx, slice(None)), patches)
         return x
 
     # ------------------------------------------------------------------
@@ -666,6 +736,7 @@ class LayerNorm(Layer):
         num_features: Size of the last (feature) dimension.
         eps:          Small constant for numerical stability. Default 1e-5.
     """
+    regularizable = False  # gamma is a scale param, not a weight matrix -- don't L2-decay it
 
     def __init__(self, num_features: int, eps: float = 1e-5):
         super().__init__()
@@ -723,9 +794,12 @@ class LayerNorm(Layer):
         dx_hat = doutput * self.gamma
 
         # Gradient of variance and mean (same derivation as BatchNorm but
-        # over the last axis)
+        # over the last axis). self._std**2 == var + eps, so this is the
+        # standard (var + eps)^(-1.5) term -- NOT var alone and NOT -0.75;
+        # a previous version of this line subtracted eps back out and used
+        # the wrong exponent, which silently produced incorrect gradients.
         dvar  = np.sum(dx_hat * self._x_centered * (-0.5)
-                       * (self._std ** 2 - self.eps) ** (-0.75),
+                       * (self._std ** 2) ** (-1.5),
                        axis=-1, keepdims=True)
         dmean = (np.sum(dx_hat * (-1.0 / self._std), axis=-1, keepdims=True)
                  + dvar * np.mean(-2.0 * self._x_centered, axis=-1, keepdims=True))
@@ -1011,6 +1085,86 @@ class Embedding(Layer):
 
     def __repr__(self) -> str:
         return f"Embedding(vocab={self.vocab_size}, dim={self.embed_dim})"
+
+
+class PositionalEncoding(Layer):
+    """
+    Fixed sinusoidal positional encoding (Vaswani et al., 2017).
+
+    Self-attention has no built-in notion of token order -- permuting the
+    time axis of the input to MultiHeadAttention produces the exact same set
+    of output vectors, just permuted the same way. This layer adds a fixed,
+    non-trainable per-position signal to the embeddings so the rest of the
+    network can recover ordering information. It should be placed
+    immediately after an Embedding layer and before any MultiHeadAttention
+    layer:
+
+        model.add(Embedding(vocab_size, d_model))
+        model.add(PositionalEncoding(d_model))
+        model.add(MultiHeadAttention(d_model, num_heads, causal=True))
+        ...
+
+    For position `pos` and channel `i` (0-indexed, d_model total channels):
+        PE(pos, 2i)   = sin(pos / 10000^(2i / d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i / d_model))
+
+    The encoding table is precomputed once up to `max_len` positions and
+    simply added elementwise to the input; it has no learnable parameters,
+    so backward is the identity function (the incoming gradient passes
+    straight through unchanged).
+
+    Args:
+        d_model: Embedding dimensionality (must match the preceding
+                 Embedding layer's embed_dim).
+        max_len: Maximum sequence length supported. Default 5000.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        self.trainable = False  # fixed, not learned -- no optimizer interaction at all
+
+        position = np.arange(max_len)[:, None]                       # (max_len, 1)
+        div_term = np.exp(np.arange(0, d_model, 2)
+                          * (-np.log(10000.0) / d_model))             # (ceil(d_model/2),)
+
+        pe = np.zeros((max_len, d_model))
+        pe[:, 0::2] = np.sin(position * div_term)
+        # d_model odd -> one fewer cosine slot than sine slot
+        pe[:, 1::2] = np.cos(position * div_term[: pe[:, 1::2].shape[1]])
+        self.pe = pe  # (max_len, d_model), not a trainable parameter
+
+    def forward(self, x: np.ndarray, training: bool = True) -> np.ndarray:
+        """
+        Args:
+            x: (N, T, d_model)
+
+        Returns:
+            x + positional encoding, same shape.
+        """
+        T = x.shape[1]
+        if T > self.max_len:
+            raise ValueError(
+                f"Sequence length {T} exceeds max_len={self.max_len} this "
+                f"PositionalEncoding was constructed with."
+            )
+        self.output = x + self.pe[:T]
+        return self.output
+
+    def backward(self, doutput: np.ndarray) -> np.ndarray:
+        """Identity: adding a constant doesn't change the gradient."""
+        return doutput
+
+    def output_shape(self, input_shape: tuple) -> tuple:
+        return input_shape
+
+    def get_parameters(self) -> dict:
+        # No learnable weights -- just enough to reconstruct the fixed table.
+        return {'d_model': self.d_model, 'max_len': self.max_len}
+
+    def __repr__(self) -> str:
+        return f"PositionalEncoding(d_model={self.d_model}, max_len={self.max_len})"
 
 
 # ===========================================================================
@@ -1670,13 +1824,35 @@ class MultiHeadAttention(Layer):
     For simplicity this implementation uses separate W_q, W_k, W_v projection
     matrices per head and a single output projection W_o.
 
+    Masking:
+        Two kinds of masking are supported, and both can be combined:
+
+        - ``causal=True`` (set at construction) automatically applies a
+          lower-triangular causal mask on every forward call, so position i
+          can only attend to positions <= i. Use this for decoder-style /
+          autoregressive models.
+        - A per-call padding mask can be supplied via ``set_padding_mask()``
+          before calling the network's forward pass, to prevent attending to
+          padded key positions in variable-length batches. The mask is
+          consumed (and cleared) by the next forward call.
+
+        Both masks are applied as an additive bias of -1e9 to the attention
+        scores before the softmax, so masked positions receive ~0 attention
+        weight. Because the mask does not depend on any learnable parameter,
+        it needs no explicit handling in the backward pass -- the ordinary
+        softmax gradient is already correct for masked (near-zero) attention
+        weights.
+
     Args:
         d_model:   Dimensionality of the input (and output) sequence.
         num_heads: Number of attention heads.  d_model must be divisible by num_heads.
         dropout:   Attention weight dropout rate. Default 0.0 (no dropout).
+        causal:    If True, apply a causal (look-ahead-blocking) mask on
+                   every forward call. Default False.
     """
 
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
+                 causal: bool = False):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError(
@@ -1686,7 +1862,12 @@ class MultiHeadAttention(Layer):
         self.num_heads = num_heads
         self.d_k       = d_model // num_heads   # dimension per head
         self.dropout   = dropout
+        self.causal    = causal
         self.trainable = True
+
+        # Optional (N, T) padding mask (1/True = real token, 0/False = pad),
+        # set via set_padding_mask() and consumed by the next forward() call.
+        self._padding_mask: Optional[np.ndarray] = None
 
         # Per-head projection matrices: shape (num_heads, d_model, d_k)
         scale = np.sqrt(2.0 / d_model)
@@ -1724,6 +1905,21 @@ class MultiHeadAttention(Layer):
         e = np.exp(x - np.max(x, axis=-1, keepdims=True))
         return e / np.sum(e, axis=-1, keepdims=True)
 
+    def set_padding_mask(self, mask: Optional[np.ndarray]) -> None:
+        """
+        Provide a key-side padding mask to apply on the *next* forward()
+        call only (it is cleared automatically afterwards, so it must be set
+        again for every batch that needs it).
+
+        Args:
+            mask: (N, T) array where 1/True marks a real token and 0/False
+                  marks padding. Padded positions are prevented from being
+                  attended to as keys (queries at padded positions can still
+                  produce output, but it is normally ignored via the loss
+                  mask / sequence-length handling elsewhere).
+        """
+        self._padding_mask = mask
+
     def forward(self, x: np.ndarray, training: bool = True) -> np.ndarray:
         """
         Args:
@@ -1743,6 +1939,22 @@ class MultiHeadAttention(Layer):
 
         # Scaled dot-product attention scores: (num_heads, N, T, T)
         scores = np.einsum('hntk,hnsk->hnts', Q, K) / np.sqrt(d_k)
+
+        # Apply causal / padding masks as an additive bias before the
+        # softmax. Neither mask depends on a learnable parameter, so no
+        # extra bookkeeping is needed for the backward pass -- the ordinary
+        # softmax gradient is already correct once masked positions have
+        # collapsed to ~0 attention weight.
+        NEG_INF = -1e9
+        if self.causal:
+            causal_block = np.triu(np.ones((T, T), dtype=bool), k=1)  # True where key pos > query pos
+            scores = np.where(causal_block, NEG_INF, scores)
+        if self._padding_mask is not None:
+            pm = np.asarray(self._padding_mask)  # (N, T), 1/True = keep
+            key_blocked = (pm == 0)[None, :, None, :]  # (1, N, 1, T) -> broadcasts over heads & queries
+            scores = np.where(key_blocked, NEG_INF, scores)
+            self._padding_mask = None  # consumed; must be re-set for the next batch
+
         attn   = self._softmax(scores)
 
         # Optional attention dropout
@@ -1837,6 +2049,7 @@ class MultiHeadAttention(Layer):
             'd_model':   self.d_model,
             'num_heads': self.num_heads,
             'dropout':   self.dropout,
+            'causal':    self.causal,
         }
 
     def set_parameters(self, parameters: dict) -> None:
@@ -1852,7 +2065,8 @@ class MultiHeadAttention(Layer):
 
     def __repr__(self) -> str:
         return (f"MultiHeadAttention(d_model={self.d_model}, "
-                f"heads={self.num_heads}, dropout={self.dropout})")
+                f"heads={self.num_heads}, dropout={self.dropout}, "
+                f"causal={self.causal})")
 
 
 # ===========================================================================

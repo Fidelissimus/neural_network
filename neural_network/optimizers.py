@@ -54,6 +54,15 @@ class SGD(Optimizer):
         v = momentum * v + (1 - momentum) * dw
         w -= lr * v
 
+    Note: this is an exponential-moving-average formulation of momentum, not
+    the "classic" v = momentum * v + dw formulation used in some other
+    libraries. Because of the (1 - momentum) factor, the effective step size
+    at steady state is scaled down by (1 - momentum) relative to plain SGD --
+    e.g. momentum=0.9 behaves roughly like a 10x smaller learning rate once
+    the velocity has warmed up, not like a straightforward speed-up. Keep
+    this in mind when porting a learning rate tuned against classic-momentum
+    SGD (e.g. PyTorch's default) into this implementation.
+
     Args:
         learning_rate: Step size. Default 0.01.
         momentum: Momentum coefficient in [0, 1). 0 means no momentum.

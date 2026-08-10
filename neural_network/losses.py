@@ -136,8 +136,12 @@ class CategoricalCrossEntropy(Loss):
     _EPS = 1e-12
 
     def forward(self, y_pred: np.ndarray, y_true: np.ndarray) -> float:
+        # Sum over the last axis (classes), not a hardcoded axis=1, so this
+        # is correct whether y_pred is (N, num_classes) or a per-timestep
+        # (N, T, num_classes) sequence output -- see the same reasoning in
+        # Softmax.forward.
         p = np.clip(y_pred, self._EPS, 1.0 - self._EPS)
-        return float(-np.mean(np.sum(y_true * np.log(p), axis=1)))
+        return float(-np.mean(np.sum(y_true * np.log(p), axis=-1)))
 
     def backward(self, y_pred: np.ndarray, y_true: np.ndarray) -> np.ndarray:
         # Simplified gradient for the Softmax + CCE combination.

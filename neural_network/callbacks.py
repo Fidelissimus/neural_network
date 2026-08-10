@@ -62,6 +62,13 @@ class EarlyStopping(Callback):
 
         # For accuracy-like metrics higher is better; for loss lower is better
         self._monitor_op = np.less if 'loss' in monitor else np.greater
+        # min_delta must tighten the bar in whichever direction is "better":
+        # loss needs to drop by at least min_delta; accuracy needs to rise by
+        # at least min_delta. Using the same subtraction for both (as an
+        # earlier version of this file did) silently disables patience for
+        # "higher is better" metrics, since a flat or slightly-worse value
+        # would still satisfy `current > best - min_delta`.
+        self._delta_sign = -1.0 if 'loss' in monitor else 1.0
         if 'loss' in monitor:
             self._best_value = np.inf
         else:
@@ -82,7 +89,9 @@ class EarlyStopping(Callback):
         if current is None:
             return  # metric not available this epoch (e.g. no validation data)
 
-        improved = self._monitor_op(current, self._best_value - self.min_delta)
+        improved = self._monitor_op(
+            current, self._best_value + self._delta_sign * self.min_delta
+        )
 
         if improved:
             self._best_value = current
@@ -230,6 +239,9 @@ class ReduceOnPlateau(Callback):
         self.verbose   = verbose
 
         self._monitor_op = np.less if 'loss' in monitor else np.greater
+        # See EarlyStopping for why the sign of min_delta must depend on
+        # whether the metric is "lower is better" or "higher is better".
+        self._delta_sign = -1.0 if 'loss' in monitor else 1.0
         self._best_value: float = np.inf if 'loss' in monitor else -np.inf
         self._wait: int = 0
 
@@ -242,7 +254,7 @@ class ReduceOnPlateau(Callback):
         if current is None:
             return
 
-        if self._monitor_op(current, self._best_value - self.min_delta):
+        if self._monitor_op(current, self._best_value + self._delta_sign * self.min_delta):
             self._best_value = current
             self._wait = 0
         else:
@@ -255,3 +267,58 @@ class ReduceOnPlateau(Callback):
                 if self.verbose:
                     print(f"\nReduceOnPlateau: epoch {epoch}: "
                           f"LR {old_lr:.6f} -> {new_lr:.6f}")
+
+
+class ModelCheckpoint(Callback):
+    """
+    Save the model to disk whenever a monitored metric improves.
+
+    A thin wrapper around `NeuralNetwork.save()` -- the actual
+    serialization logic already lives there, this callback just decides
+    *when* to call it. Mirrors the improvement-direction logic used by
+    EarlyStopping / ReduceOnPlateau (lower is better for loss metrics,
+    higher is better for accuracy metrics).
+
+    Args:
+        filepath:    Destination path for the saved model, e.g.
+                     'best_model.json'. Overwritten every time the
+                     monitored metric improves.
+        monitor:     Name of the quantity to watch. One of 'val_loss',
+                     'train_loss', 'val_acc', 'train_acc'. Default 'val_loss'.
+        save_best_only: If True (default), only save when `monitor` improves.
+                     If False, save unconditionally at the end of every epoch
+                     (useful for keeping the most recent checkpoint rather
+                     than the best one).
+        verbose:     Print a message whenever a checkpoint is saved. Default True.
+    """
+
+    def __init__(self, filepath: str, monitor: str = 'val_loss',
+                 save_best_only: bool = True, verbose: bool = True):
+        self.filepath       = filepath
+        self.monitor        = monitor
+        self.save_best_only = save_best_only
+        self.verbose        = verbose
+
+        self._monitor_op  = np.less if 'loss' in monitor else np.greater
+        self._best_value: float = np.inf if 'loss' in monitor else -np.inf
+
+    def on_train_begin(self, network) -> None:
+        self._best_value = np.inf if 'loss' in self.monitor else -np.inf
+
+    def on_epoch_end(self, network, epoch: int, logs: dict) -> None:
+        if not self.save_best_only:
+            network.save(self.filepath)
+            if self.verbose:
+                print(f"\nModelCheckpoint: epoch {epoch}: saved to {self.filepath}")
+            return
+
+        current = logs.get(self.monitor)
+        if current is None:
+            return  # metric not available this epoch (e.g. no validation data)
+
+        if self._monitor_op(current, self._best_value):
+            self._best_value = current
+            network.save(self.filepath)
+            if self.verbose:
+                print(f"\nModelCheckpoint: epoch {epoch}: {self.monitor} "
+                      f"improved to {current:.6f}, saved to {self.filepath}")
